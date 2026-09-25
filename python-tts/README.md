@@ -116,6 +116,49 @@ uv run tts_stress.py your-endpoint-name \
 
 ---
 
+## `tts_async.py`
+
+Synthesizes speech on an **asynchronous** endpoint (its `EndpointConfig` has an
+`AsyncInferenceConfig`) via `InvokeEndpointAsync`, sending the `{"text": "..."}`
+payload **inline** in the API call (`Body`) instead of uploading it to S3 first
+([AWS announcement](https://aws.amazon.com/blogs/machine-learning/amazon-sagemaker-ai-async-inference-now-supports-inline-request-payloads/)).
+The audio still lands in the endpoint's S3 output location; the script polls for
+it (or the failure object) and prints per-request latency, size and format.
+
+Inline payloads are capped at 128,000 bytes — well above Deepgram's 2,000-character
+TTS text limit. Needs a recent boto3 (older releases reject `Body` on this call);
+`uv sync` installs one. No input bucket is needed: the caller needs
+`sagemaker:InvokeEndpointAsync` plus `s3:GetObject` on the output/failure
+prefixes, and the endpoint's execution role only needs `s3:PutObject` there.
+
+```bash
+# one request per line of tts-input.txt
+uv run tts_async.py your-async-tts-endpoint
+
+# 20 requests, 5 in flight, WAV output saved locally
+uv run tts_async.py your-async-tts-endpoint --text "Hello from Deepgram." \
+  --requests 20 --concurrency 5 \
+  --extra "encoding=linear16&container=wav" --save-audio-dir out/
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `endpoint_name` | Async-configured SageMaker endpoint name (required) | — |
+| `--text "..."` | Inline text to synthesize (overrides `--text-file`) | — |
+| `--text-file PATH` | One phrase per line; requests cycle through them | `tts-input.txt` |
+| `--voice VOICE` | Deepgram TTS voice model | `aura-2-thalia-en` |
+| `--extra "k=v&k2=v2"` | Extra `/v1/speak` query params appended verbatim | — |
+| `--requests N` | Total invocations | one per phrase (or `--concurrency` if larger) |
+| `--concurrency N` | Invocations in flight | `1` |
+| `--invocation-timeout SECONDS` | Per-invocation SageMaker timeout (max 3600) | `600` |
+| `--poll-interval SECONDS` | Seconds between S3 polls per request | `1.0` |
+| `--inference-id-prefix PREFIX` | `InferenceId` prefix | `async-<random>` |
+| `--save-audio-dir DIR` | Save each request's audio (extension sniffed from bytes) | — |
+| `--region REGION` | AWS region | `us-east-2` |
+| `--fips` | Use the FIPS 140-3 runtime and S3 endpoints | off |
+
+---
+
 ## End-to-end correctness drivers (`e2e/`)
 
 Run-everything correctness gates that exercise a TTS endpoint across its full

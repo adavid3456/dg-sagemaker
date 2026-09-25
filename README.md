@@ -98,6 +98,7 @@ See [python-tts/README.md](python-tts/README.md) for full setup and usage.
 
 Scripts:
 - [`tts_stress.py`](python-tts/tts_stress.py) — streams text phrases to multiple simultaneous bidirectional connections; plays audio from one selectable connection
+- [`tts_async.py`](python-tts/tts_async.py) — synthesizes via the SageMaker `InvokeEndpointAsync` API with an **inline** request payload (no S3 input upload) and collects the audio from the endpoint's S3 output location; configurable concurrency and a latency/throughput summary
 
 End-to-end correctness gates ([`python-tts/e2e/`](python-tts/e2e/)) — validate the **synthesized audio itself** (non-empty, correct container/codec, non-silent, requested sample rate, speed→duration), so no second transcription endpoint is required:
 
