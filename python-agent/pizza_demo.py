@@ -8,12 +8,24 @@ answers with a `FunctionCallResponse` carrying the updated order and total, and
 pushes the new state to a local web page. Prices and totals the agent reads out
 therefore come from this script, never from the LLM's arithmetic.
 
-Audio runs in the terminal exactly as in agent_live.py (same mic/speaker loop,
-same flags: --push-to-talk, --conversational, recording). The browser only shows
-the menu, the current order, the function-call log, and the transcript.
+Audio runs IN THE BROWSER by default. Click "Start call" and the page captures the
+mic with getUserMedia({audio: {echoCancellation: true, ...}}), so the browser's
+built-in WebRTC echo canceller removes the agent's voice from the mic and laptop
+speakers work without push-to-talk. The page streams 16 kHz PCM to this script
+over its WebSocket; the script relays it to stem and relays the agent's 24 kHz
+audio back. Agent audio is played through a local WebRTC loopback by default
+(Chrome's canceller has historically only subtracted audio played via WebRTC);
+open the page with ?playback=direct to compare plain Web Audio playback.
 
-    uv run pizza_demo.py                      # opens http://127.0.0.1:8765
-    uv run pizza_demo.py --conversational --push-to-talk
+    uv run pizza_demo.py --host <public-ip>            # opens http://127.0.0.1:8765
+    uv run pizza_demo.py --host <public-ip> --conversational
+    uv run pizza_demo.py --host <public-ip> --terminal-audio   # old sounddevice path
+
+The page must be opened as http://127.0.0.1 or http://localhost: browsers only
+allow microphone access from a secure context, and a plain-http LAN address isn't
+one. --terminal-audio keeps the agent_live.py mic/speaker loop (with its
+--push-to-talk and escalation demo) and uses the page as a display only.
+Recording (on by default) is written by this script in both modes.
 
 Every function that changes the order sets `defer_until_eot`, so stem waits for a
 confirmed end of turn before dispatching it. Without that, an eager end-of-turn
@@ -23,16 +35,19 @@ draft (the caller pausing mid-sentence) could add the same pizza twice.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 import time
 import webbrowser
 from http import HTTPStatus
+from pathlib import Path
 
+import websockets
 from websockets.asyncio.server import serve
 
-from agent_converse import build_settings
-from agent_live import build_parser, run
+from agent_converse import OUTPUT_RATE, build_settings
+from agent_live import build_parser, run, save_recording
 from scenarios import apply_scenario
 
 SIZES = ("small", "medium", "large")
@@ -312,47 +327,201 @@ class Order:
 
 
 # ------------------------------------------------------------------------------
-# Browser side: one static page plus a /events WebSocket that receives the state.
+# Browser side: pizza_board.html plus one /events WebSocket per tab. Text frames
+# carry board state and call control; binary frames carry audio (browser -> here:
+# 16 kHz int16 mic; here -> browser: 24 kHz int16 agent audio).
 # ------------------------------------------------------------------------------
 
+PAGE_TEMPLATE = (Path(__file__).with_name("pizza_board.html")).read_text()
+
+
+class Call:
+    """One browser-audio call: a stem connection bridged to one browser tab."""
+
+    def __init__(self, hub: "Hub", browser) -> None:
+        self.hub = hub
+        self.args = hub.args
+        self.browser = browser
+        self.stem = None
+        self.task: asyncio.Task | None = None
+        self.t0 = 0.0
+        self.rec_user = bytearray()
+        self.rec_agent = bytearray()
+
+    async def _to_browser(self, data) -> None:
+        with contextlib.suppress(websockets.ConnectionClosed):
+            await self.browser.send(data)
+
+    # Recording. The caller track is the mic stream as it arrived (continuous, so
+    # it keeps its own clock). Agent audio is placed on the wall clock at arrival,
+    # which is when the browser starts playing it, and cut back on barge-in, when
+    # the browser drops whatever it had queued.
+    def _place_agent(self, pcm: bytes) -> None:
+        now = int((time.monotonic() - self.t0) * OUTPUT_RATE) * 2
+        if len(self.rec_agent) < now:
+            self.rec_agent.extend(bytes(now - len(self.rec_agent)))
+        self.rec_agent.extend(pcm)
+
+    def _cut_agent(self) -> None:
+        now = int((time.monotonic() - self.t0) * OUTPUT_RATE) * 2
+        del self.rec_agent[now:]
+
+    async def feed(self, pcm: bytes) -> None:
+        if self.stem is None:
+            return  # mic frames before stem is connected are dropped
+        if self.args.record:
+            self.rec_user.extend(pcm)
+        with contextlib.suppress(websockets.ConnectionClosed):
+            await self.stem.send(pcm)
+
+    async def run(self) -> None:
+        url = f"ws://{self.args.host}:{self.args.port}/v1/agent/converse"
+        settings = build_settings(self.args)
+        settings["agent"]["think"]["functions"] = FUNCTIONS
+        print(f"call: connecting {url}", flush=True)
+        try:
+            async with websockets.connect(url, max_size=None, open_timeout=10) as stem:
+                await stem.send(json.dumps(settings))
+                self.t0 = time.monotonic()
+                self.stem = stem
+                await self._to_browser(json.dumps({"type": "call", "state": "connected"}))
+                async for msg in stem:
+                    if isinstance(msg, bytes):
+                        if self.args.record:
+                            self._place_agent(msg)
+                        await self._to_browser(msg)
+                        continue
+                    m = json.loads(msg)
+                    t = m.get("type")
+                    if t == "UserStartedSpeaking":
+                        # Barge-in: the browser drops its queued agent audio.
+                        self._cut_agent()
+                        await self._to_browser('{"type":"flush"}')
+                    elif t == "AgentAudioDone":
+                        await self._to_browser('{"type":"reply_done"}')
+                    elif t == "ConversationText":
+                        print(f"  [{m.get('role')}] {m.get('content', '')}", flush=True)
+                    elif t in ("Error", "Warning"):
+                        detail = m.get("description") or m.get("message") or json.dumps(m)
+                        print(f"  [{t}] {detail}", flush=True)
+                        await self._to_browser(json.dumps(
+                            {"type": "notice", "text": f"{t}: {detail}"}))
+                    elif t == "ConversationalEvent" and m.get("event") in (
+                            "agent_backchannel", "user_backchannel"):
+                        print(f"  [{m['event']}] {m.get('text', '')}", flush=True)
+                    await self.hub.on_message(stem, m)
+        except (OSError, TimeoutError, websockets.InvalidHandshake) as e:
+            text = (f"Could not reach stem at {url} ({type(e).__name__}). Is the "
+                    "container up, and does its security group admit your IP on "
+                    f"{self.args.port}?")
+            print(f"call: {text}", file=sys.stderr, flush=True)
+            await self._to_browser(json.dumps({"type": "notice", "text": text}))
+        except websockets.ConnectionClosed:
+            pass
+        finally:
+            self.stem = None
+            print("call: ended", flush=True)
+            if self.args.record and (self.rec_user or self.rec_agent):
+                try:
+                    save_recording(Path(self.args.record_dir),
+                                   time.strftime("%Y%m%d-%H%M%S") + "_pizza",
+                                   bytes(self.rec_user), bytes(self.rec_agent))
+                except OSError as e:
+                    print(f"  [record] could not save recording: {e}", file=sys.stderr)
+            if self.hub.call is self:
+                self.hub.call = None
+            self.hub.status = "idle"
+            await self._to_browser(json.dumps({"type": "call", "state": "ended"}))
+            await self.hub.push()
+
+
 class Hub:
-    def __init__(self, order: Order) -> None:
-        self.order = order
+    def __init__(self, args, audio: str) -> None:
+        self.args = args
+        self.audio = audio               # "browser" or "terminal"
+        self.order = Order()
         self.clients: set = set()
         self.log: list[dict] = []        # transcript + function calls, oldest first
-        self.status = "connecting"
+        self.status = "idle" if audio == "browser" else "connecting"
+        self.call: Call | None = None
 
     def state(self) -> str:
         return json.dumps({"type": "state", "menu": MENU, "order": self.order.snapshot(),
-                           "log": self.log[-200:], "status": self.status})
+                           "log": self.log[-200:], "status": self.status,
+                           "audio": self.audio, "call": self.call is not None})
 
     async def push(self) -> None:
         msg = self.state()
         for ws in list(self.clients):
             try:
                 await ws.send(msg)
-            except Exception:
+            except websockets.ConnectionClosed:
                 self.clients.discard(ws)
+
+    async def start_call(self, browser) -> None:
+        if self.audio != "browser":
+            await browser.send(json.dumps({"type": "notice", "text":
+                "Started with --terminal-audio: talk in the terminal, not here."}))
+            return
+        if self.call is not None:
+            await browser.send(json.dumps({"type": "notice", "text":
+                "A call is already running in another tab."}))
+            await browser.send(json.dumps({"type": "call", "state": "ended"}))
+            return
+        self.order = Order()             # every call is a fresh order
+        self.log = []
+        self.status = "connecting"
+        self.call = Call(self, browser)
+        self.call.task = asyncio.create_task(self.call.run())
+        await self.push()
+
+    async def stop_call(self, browser) -> None:
+        call = self.call
+        if call is not None and call.browser is browser and call.task:
+            call.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call.task
 
     async def handler(self, ws) -> None:
         self.clients.add(ws)
         try:
             await ws.send(self.state())
-            await ws.wait_closed()
+            async for msg in ws:
+                if isinstance(msg, bytes):
+                    if self.call is not None and self.call.browser is ws:
+                        await self.call.feed(msg)
+                    continue
+                try:
+                    m = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+                if m.get("type") == "start":
+                    await self.start_call(ws)
+                elif m.get("type") == "stop":
+                    await self.stop_call(ws)
+        except websockets.ConnectionClosed:
+            pass
         finally:
             self.clients.discard(ws)
+            await self.stop_call(ws)     # closing the tab hangs up its call
 
     def process_request(self, connection, request):
         if request.path == "/events":
             return None  # continue the WebSocket handshake
-        if request.path in ("/", "/index.html"):
-            resp = connection.respond(HTTPStatus.OK, PAGE)
+        if request.path.split("?")[0] in ("/", "/index.html"):
+            page = PAGE_TEMPLATE.replace("__CONFIG__", json.dumps(
+                {"playbackBufferMs": self.args.playback_buffer_ms}))
+            resp = connection.respond(HTTPStatus.OK, page)
             del resp.headers["Content-Type"]
             resp.headers["Content-Type"] = "text/html; charset=utf-8"
             return resp
+        if request.path == "/favicon.ico":
+            return connection.respond(HTTPStatus.NO_CONTENT, "")
         return connection.respond(HTTPStatus.NOT_FOUND, "not found\n")
 
     async def on_message(self, ws, m: dict) -> None:
+        """Server message hook: runs function calls and tracks board state. `ws` is
+        the stem connection (FunctionCallResponse goes back on it)."""
         t = m.get("type")
         if t == "FunctionCallRequest":
             for fc in m.get("functions", []):
@@ -372,7 +541,7 @@ class Hub:
         elif t == "ConversationText":
             self.log.append({"kind": "text", "role": m.get("role"),
                              "content": m.get("content", "")})
-        elif t in ("UserStartedSpeaking",):
+        elif t == "UserStartedSpeaking":
             self.status = "caller speaking"
         elif t == "AgentThinking":
             self.status = "thinking"
@@ -385,135 +554,29 @@ class Hub:
         await self.push()
 
 
-PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pizza Order Demo</title>
-<style>
-:root{--bg:#faf7f2;--panel:#fff;--ink:#1f1b16;--muted:#7a6f63;--line:#ece4d8;
---accent:#c8412b;--accent-soft:#fbe3dc;--ok:#2f7d4f;--ok-soft:#dff1e6;--mono:ui-monospace,Menlo,monospace}
-@media (prefers-color-scheme:dark){:root{--bg:#16130f;--panel:#201c17;--ink:#f3ede4;
---muted:#a89c8d;--line:#332d25;--accent:#ff7a5c;--accent-soft:#3a221b;--ok:#6fcf97;--ok-soft:#1d3326}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,sans-serif}
-header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line)}
-header h1{font-size:18px;margin:0}
-#status{margin-left:auto;font-size:13px;padding:3px 10px;border-radius:99px;background:var(--line);color:var(--muted)}
-#status.agent{background:var(--accent-soft);color:var(--accent)}
-#status.caller{background:var(--ok-soft);color:var(--ok)}
-main{display:grid;grid-template-columns:1fr 1.1fr 1fr;gap:16px;padding:16px 20px;max-width:1400px;margin:0 auto}
-@media (max-width:980px){main{grid-template-columns:1fr}}
-section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;min-width:0}
-h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
-h3{font-size:14px;margin:14px 0 6px}
-.row{display:flex;justify-content:space-between;gap:10px;padding:3px 0}
-.price{font-variant-numeric:tabular-nums;color:var(--muted);white-space:nowrap}
-.small{font-size:13px;color:var(--muted)}
-#lines .row{padding:8px 10px;border-radius:8px;margin:0 -10px}
-#lines .n{color:var(--muted);width:1.6em;flex:none}
-#lines .item{flex:1}
-.flash{animation:flash 1.6s ease-out}
-@keyframes flash{from{background:var(--accent-soft)}to{background:transparent}}
-.empty{color:var(--muted);font-style:italic;padding:8px 0}
-.totals{border-top:1px solid var(--line);margin-top:10px;padding-top:8px}
-.total{font-weight:700;font-size:18px}
-#submitted{display:none;margin-top:12px;padding:12px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-weight:600}
-#customer{margin-top:10px}
-#log{max-height:70vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
-.msg{padding:7px 10px;border-radius:10px;max-width:92%}
-.msg.user{align-self:flex-end;background:var(--ok-soft)}
-.msg.assistant{align-self:flex-start;background:var(--line)}
-.fn{font:12px/1.4 var(--mono);padding:6px 9px;border-left:3px solid var(--accent);background:var(--bg);border-radius:4px;overflow-wrap:anywhere}
-.fn.err{border-color:#d9a400}
-.fn b{color:var(--accent)}
-</style></head><body>
-<header><h1>🍕 Slice of Heaven Pizza</h1><span class="small">voice order demo</span>
-<span id="status">connecting</span></header>
-<main>
-<section><h2>Menu</h2><div id="menu"></div></section>
-<section><h2>Current order</h2><div id="lines"></div>
-<div class="totals" id="totals"></div><div id="customer" class="small"></div>
-<div id="submitted"></div></section>
-<section><h2>Conversation &amp; function calls</h2><div id="log"></div></section>
-</main>
-<script>
-const $ = id => document.getElementById(id);
-const money = v => "$" + Number(v).toFixed(2);
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let menuDrawn = false, lastSig = "";
-function drawMenu(m){
-  let h = "<h3>Pizzas <span class='small'>S / M / L</span></h3>";
-  for (const [n,p] of Object.entries(m.pizzas))
-    h += `<div class="row"><span>${esc(n)}</span><span class="price">${p.map(money).join(" / ")}</span></div>`;
-  h += `<div class="small">Extra toppings ${m.topping_price.map(money).join(" / ")}: ${m.toppings.map(esc).join(", ")}. Stuffed crust +$2.00.</div>`;
-  for (const sec of ["sides","drinks","desserts"]) {
-    h += `<h3>${sec[0].toUpperCase()+sec.slice(1)}</h3>`;
-    for (const [n,p] of Object.entries(m[sec]))
-      h += `<div class="row"><span>${esc(n)}</span><span class="price">${money(p)}</span></div>`;
-  }
-  $("menu").innerHTML = h; menuDrawn = true;
-}
-function drawOrder(o){
-  const sig = JSON.stringify(o.lines);
-  $("lines").innerHTML = o.lines.length ? o.lines.map(l =>
-    `<div class="row" data-line="${l.line}"><span class="n">${l.line}.</span><span class="item">${esc(l.item)}</span><span class="price">${money(l.price)}</span></div>`
-  ).join("") : '<div class="empty">Nothing yet — start talking.</div>';
-  if (sig !== lastSig && o.changed_line) {
-    const el = document.querySelector(`[data-line="${o.changed_line}"]`);
-    if (el) el.classList.add("flash");
-  }
-  lastSig = sig;
-  let t = `<div class="row"><span>Subtotal</span><span class="price">${money(o.subtotal)}</span></div>`;
-  if (o.delivery_fee) t += `<div class="row"><span>Delivery</span><span class="price">${money(o.delivery_fee)}</span></div>`;
-  t += `<div class="row"><span>Tax</span><span class="price">${money(o.tax)}</span></div>`;
-  t += `<div class="row total"><span>Total</span><span>${money(o.total)}</span></div>`;
-  $("totals").innerHTML = t;
-  const c = o.customer;
-  $("customer").innerHTML = c ? `${esc(c.name)} · ${esc(c.fulfillment)}${c.address ? " · " + esc(c.address) : ""}${c.phone ? " · " + esc(c.phone) : ""}` : "";
-  const s = $("submitted");
-  if (o.submitted) { s.style.display = "block"; s.textContent = `✓ Order #${o.submitted.number} placed — ready in about ${o.submitted.ready_in_minutes} minutes`; }
-  else s.style.display = "none";
-}
-function drawLog(log){
-  const el = $("log"), atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-  el.innerHTML = log.map(e => e.kind === "fn"
-    ? `<div class="fn ${e.ok ? "" : "err"}"><b>${esc(e.name)}</b>(${esc(e.args)})<br>→ ${esc(e.result)}</div>`
-    : `<div class="msg ${esc(e.role)}">${esc(e.content)}</div>`).join("");
-  if (atBottom) el.scrollTop = el.scrollHeight;
-}
-function drawStatus(s){
-  const el = $("status"); el.textContent = s;
-  el.className = s.startsWith("agent") ? "agent" : s.startsWith("caller") ? "caller" : "";
-}
-function connect(){
-  const ws = new WebSocket(`ws://${location.host}/events`);
-  ws.onmessage = ev => {
-    const m = JSON.parse(ev.data);
-    if (!menuDrawn) drawMenu(m.menu);
-    drawOrder(m.order); drawLog(m.log); drawStatus(m.status);
-  };
-  ws.onclose = () => { drawStatus("disconnected — retrying"); setTimeout(connect, 1500); };
-}
-connect();
-</script></body></html>
-"""
-
-
 async def amain(args) -> int:
-    order = Order()
-    hub = Hub(order)
-    settings = build_settings(args)
-    settings["agent"]["think"]["functions"] = FUNCTIONS
+    hub = Hub(args, "terminal" if args.terminal_audio else "browser")
     async with serve(hub.handler, "127.0.0.1", args.web_port,
-                     process_request=hub.process_request):
+                     process_request=hub.process_request, max_size=None):
         page = f"http://127.0.0.1:{args.web_port}/"
         print(f"order board: {page}")
         if args.open_browser:
             webbrowser.open(page)
-        rc = await run(args, settings=settings, on_message=hub.on_message)
-        if order.lines:
-            print("\nfinal order:\n" + json.dumps(order.snapshot(), indent=2))
-        return rc
+        if args.terminal_audio:
+            rc = await run(args, settings=_terminal_settings(args),
+                           on_message=hub.on_message)
+            if hub.order.lines:
+                print("\nfinal order:\n" + json.dumps(hub.order.snapshot(), indent=2))
+            return rc
+        print("click 'Start call' on the page (Ctrl-C here to quit)")
+        await asyncio.Future()           # serve until Ctrl-C
+    return 0
+
+
+def _terminal_settings(args) -> dict:
+    settings = build_settings(args)
+    settings["agent"]["think"]["functions"] = FUNCTIONS
+    return settings
 
 
 def main() -> int:
@@ -522,6 +585,9 @@ def main() -> int:
                    help="local port for the order board (default 8765)")
     p.add_argument("--no-browser", dest="open_browser", action="store_false",
                    help="don't open the order board automatically")
+    p.add_argument("--terminal-audio", action="store_true",
+                   help="use the terminal mic/speaker (agent_live.py's loop) instead "
+                        "of the browser; the page becomes a display only")
     args = p.parse_args()
     args.prompt = args.prompt or PROMPT
     args.greeting = args.greeting or GREETING
@@ -529,7 +595,7 @@ def main() -> int:
     try:
         return asyncio.run(amain(args))
     except KeyboardInterrupt:
-        print("\nhung up.")
+        print("\nbye.")
         return 0
 
 

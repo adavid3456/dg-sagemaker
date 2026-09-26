@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pizza Order Demo</title>
+<style>
+:root{--bg:#faf7f2;--panel:#fff;--ink:#1f1b16;--muted:#7a6f63;--line:#ece4d8;
+--accent:#c8412b;--accent-soft:#fbe3dc;--ok:#2f7d4f;--ok-soft:#dff1e6;--warn:#9a6a00;--warn-soft:#fbf0d2;
+--mono:ui-monospace,Menlo,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#16130f;--panel:#201c17;--ink:#f3ede4;
+--muted:#a89c8d;--line:#332d25;--accent:#ff7a5c;--accent-soft:#3a221b;--ok:#6fcf97;--ok-soft:#1d3326;
+--warn:#f2c14e;--warn-soft:#3a3018}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:12px 20px;border-bottom:1px solid var(--line)}
+header h1{font-size:18px;margin:0}
+.spacer{flex:1}
+.pill{font-size:13px;padding:3px 10px;border-radius:99px;background:var(--line);color:var(--muted)}
+.pill.agent{background:var(--accent-soft);color:var(--accent)}
+.pill.caller{background:var(--ok-soft);color:var(--ok)}
+button{font:inherit;font-weight:600;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;background:var(--accent);color:#fff}
+button.secondary{background:var(--line);color:var(--ink)}
+button:disabled{opacity:.5;cursor:default}
+#meter{width:70px;height:8px;border-radius:4px;background:var(--line);overflow:hidden}
+#meter i{display:block;height:100%;width:0;background:var(--ok);transition:width .08s}
+#audioinfo{font-size:12px;color:var(--muted)}
+#notice{display:none;margin:12px 20px 0;padding:10px 12px;border-radius:8px;background:var(--warn-soft);color:var(--warn)}
+main{display:grid;grid-template-columns:1fr 1.1fr 1fr;gap:16px;padding:16px 20px;max-width:1400px;margin:0 auto}
+@media (max-width:980px){main{grid-template-columns:1fr}}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;min-width:0}
+h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+h3{font-size:14px;margin:14px 0 6px}
+.row{display:flex;justify-content:space-between;gap:10px;padding:3px 0}
+.price{font-variant-numeric:tabular-nums;color:var(--muted);white-space:nowrap}
+.small{font-size:13px;color:var(--muted)}
+#lines .row{padding:8px 10px;border-radius:8px;margin:0 -10px}
+#lines .n{color:var(--muted);width:1.6em;flex:none}
+#lines .item{flex:1}
+.flash{animation:flash 1.6s ease-out}
+@keyframes flash{from{background:var(--accent-soft)}to{background:transparent}}
+.empty{color:var(--muted);font-style:italic;padding:8px 0}
+.totals{border-top:1px solid var(--line);margin-top:10px;padding-top:8px}
+.total{font-weight:700;font-size:18px}
+#submitted{display:none;margin-top:12px;padding:12px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-weight:600}
+#customer{margin-top:10px}
+#log{max-height:70vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+.msg{padding:7px 10px;border-radius:10px;max-width:92%}
+.msg.user{align-self:flex-end;background:var(--ok-soft)}
+.msg.assistant{align-self:flex-start;background:var(--line)}
+.fn{font:12px/1.4 var(--mono);padding:6px 9px;border-left:3px solid var(--accent);background:var(--bg);border-radius:4px;overflow-wrap:anywhere}
+.fn.err{border-color:var(--warn)}
+.fn b{color:var(--accent)}
+</style></head><body>
+<header><h1>🍕 Slice of Heaven Pizza</h1><span class="small">voice order demo</span>
+<span class="spacer"></span>
+<span id="audioinfo"></span>
+<div id="meter" title="microphone level"><i></i></div>
+<button id="mute" class="secondary" disabled>Mute</button>
+<button id="call">Start call</button>
+<span id="status" class="pill">connecting</span></header>
+<div id="notice"></div>
+<main>
+<section><h2>Menu</h2><div id="menu"></div></section>
+<section><h2>Current order</h2><div id="lines"></div>
+<div class="totals" id="totals"></div><div id="customer" class="small"></div>
+<div id="submitted"></div></section>
+<section><h2>Conversation &amp; function calls</h2><div id="log"></div></section>
+</main>
+<audio id="agentAudio" autoplay></audio>
+<script>
+const CONFIG = __CONFIG__;
+const $ = id => document.getElementById(id);
+const money = v => "$" + Number(v).toFixed(2);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const params = new URLSearchParams(location.search);
+// "loopback" (default): agent audio goes through a local RTCPeerConnection pair into
+// an <audio> element. Chrome's echo canceller has historically only subtracted audio
+// that reaches the speaker through WebRTC, so plain Web Audio playback can leak
+// straight back into the mic. "direct": Web Audio to the speakers, for comparison.
+const PLAYBACK = params.get("playback") === "direct" ? "direct" : "loopback";
+
+// ---------------------------------------------------------------- audio worklets
+// Mic: resample the capture context's rate to 16 kHz, emit 20 ms int16 frames.
+const MIC_WORKLET = `
+class Mic extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.step = sampleRate / 16000; this.pos = 0; this.prev = 0;
+    this.out = new Int16Array(320); this.n = 0; this.muted = false;
+    this.sq = 0; this.cnt = 0;
+    this.port.onmessage = e => { if ("muted" in e.data) this.muted = e.data.muted; };
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch || !ch.length) return true;
+    let p = this.pos;
+    for (;;) {
+      const i = Math.floor(p), j = i + 1;
+      if (j >= ch.length) break;
+      const a = i < 0 ? this.prev : ch[i], b = ch[j];
+      let v = this.muted ? 0 : a + (b - a) * (p - i);
+      v = v > 1 ? 1 : v < -1 ? -1 : v;
+      this.out[this.n++] = v < 0 ? v * 32768 : v * 32767;
+      this.sq += v * v; this.cnt++;
+      if (this.n === 320) {
+        this.port.postMessage({pcm: this.out.buffer}, [this.out.buffer]);
+        this.out = new Int16Array(320); this.n = 0;
+        if (this.cnt >= 1600) { this.port.postMessage({level: Math.sqrt(this.sq / this.cnt)}); this.sq = 0; this.cnt = 0; }
+      }
+      p += this.step;
+    }
+    this.pos = p - ch.length; this.prev = ch[ch.length - 1];
+    return true;
+  }
+}
+registerProcessor("mic", Mic);`;
+
+// Player: 24 kHz int16 in, with the same re-buffering as agent_live.py's Player:
+// stem paces agent audio to real time with a 1 s lead, so when the network falls
+// behind and the queue runs dry mid-reply, hold silence until TARGET ms are queued
+// again rather than crackling. After reply_done the tail plays out immediately.
+const PLAYER_WORKLET = `
+class Player extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this.q = []; this.off = 0; this.queued = 0;
+    this.target = Math.round(sampleRate * opts.processorOptions.bufferMs / 1000);
+    this.buffering = false; this.playing = false; this.done = false; this.rebuffers = 0;
+    this.port.onmessage = e => {
+      const d = e.data;
+      if (d.pcm) {
+        const s = new Int16Array(d.pcm), f = new Float32Array(s.length);
+        for (let i = 0; i < s.length; i++) f[i] = s[i] / 32768;
+        this.q.push(f); this.queued += f.length; this.done = false;
+      } else if (d.flush) {
+        this.q = []; this.off = 0; this.queued = 0; this.buffering = false; this.playing = false;
+      } else if (d.done) { this.done = true; }
+    };
+  }
+  process(_inputs, outputs) {
+    const out = outputs[0][0]; let k = 0;
+    if (this.buffering && (this.queued >= this.target || (this.done && this.queued > 0))) this.buffering = false;
+    while (!this.buffering && k < out.length && this.q.length) {
+      const h = this.q[0], take = Math.min(h.length - this.off, out.length - k);
+      out.set(h.subarray(this.off, this.off + take), k);
+      k += take; this.off += take; this.queued -= take;
+      if (this.off === h.length) { this.q.shift(); this.off = 0; }
+    }
+    if (k > 0) this.playing = true;
+    if (k < out.length && this.playing) {
+      if (!this.done && this.target > 0 && !this.buffering) {
+        this.buffering = true; this.rebuffers++;
+        this.port.postMessage({rebuffers: this.rebuffers});
+      }
+      if (this.done) this.playing = false;
+    }
+    return true;
+  }
+}
+registerProcessor("player", Player);`;
+
+const workletURL = src => URL.createObjectURL(new Blob([src], {type: "application/javascript"}));
+
+// ---------------------------------------------------------------- call state
+let ws, call = null, muted = false, menuDrawn = false, lastSig = "";
+
+async function loopbackTo(audioEl, stream) {
+  const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+  a.onicecandidate = e => e.candidate && b.addIceCandidate(e.candidate);
+  b.onicecandidate = e => e.candidate && a.addIceCandidate(e.candidate);
+  const remote = new Promise(r => b.ontrack = e => r(e.streams[0]));
+  stream.getTracks().forEach(t => a.addTrack(t, stream));
+  const offer = await a.createOffer(); await a.setLocalDescription(offer); await b.setRemoteDescription(offer);
+  const answer = await b.createAnswer(); await b.setLocalDescription(answer); await a.setRemoteDescription(answer);
+  audioEl.srcObject = await remote;
+  await audioEl.play();
+  return [a, b];
+}
+
+async function startCall() {
+  $("call").disabled = true;
+  try {
+    const mic = await navigator.mediaDevices.getUserMedia({audio: {
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
+    const s = mic.getAudioTracks()[0].getSettings();
+    const capCtx = new AudioContext();
+    await capCtx.audioWorklet.addModule(workletURL(MIC_WORKLET));
+    const micNode = new AudioWorkletNode(capCtx, "mic");
+    const sink = capCtx.createGain(); sink.gain.value = 0;   // keeps the graph pulling
+    capCtx.createMediaStreamSource(mic).connect(micNode); micNode.connect(sink); sink.connect(capCtx.destination);
+
+    const playCtx = new AudioContext({sampleRate: 24000});
+    await playCtx.audioWorklet.addModule(workletURL(PLAYER_WORKLET));
+    const player = new AudioWorkletNode(playCtx, "player",
+      {outputChannelCount: [1], processorOptions: {bufferMs: CONFIG.playbackBufferMs}});
+    let pcs = [];
+    if (PLAYBACK === "loopback") {
+      const dest = playCtx.createMediaStreamDestination();
+      player.connect(dest);
+      pcs = await loopbackTo($("agentAudio"), dest.stream);
+    } else {
+      player.connect(playCtx.destination);
+    }
+    await capCtx.resume(); await playCtx.resume();
+
+    call = {mic, capCtx, playCtx, micNode, player, pcs, rebuffers: 0};
+    micNode.port.onmessage = e => {
+      if (e.data.pcm) { if (ws && ws.readyState === 1) ws.send(e.data.pcm); }
+      else if (e.data.level !== undefined) $("meter").firstChild.style.width = Math.min(100, e.data.level * 400) + "%";
+    };
+    player.port.onmessage = e => { if (e.data.rebuffers) { call.rebuffers = e.data.rebuffers; drawAudioInfo(s); } };
+    call.settings = s;
+    drawAudioInfo(s);
+    ws.send(JSON.stringify({type: "start"}));
+    $("call").textContent = "Hang up"; $("call").disabled = false; $("mute").disabled = false;
+  } catch (err) {
+    showNotice("Could not start audio: " + err.message);
+    stopCall(false);
+  }
+}
+
+function drawAudioInfo(s) {
+  const aec = s.echoCancellation === true ? "echo cancellation on" :
+              s.echoCancellation === false ? "echo cancellation OFF" : "echo cancellation unknown";
+  $("audioinfo").textContent = `${aec} · playback ${PLAYBACK}` +
+    (call && call.rebuffers ? ` · re-buffered ${call.rebuffers}x` : "");
+}
+
+function stopCall(tellServer = true) {
+  if (tellServer && ws && ws.readyState === 1) ws.send(JSON.stringify({type: "stop"}));
+  if (call) {
+    call.mic.getTracks().forEach(t => t.stop());
+    call.capCtx.close(); call.playCtx.close();
+    call.pcs.forEach(pc => pc.close());
+    $("agentAudio").srcObject = null;
+  }
+  call = null;
+  $("call").textContent = "Start call"; $("call").disabled = false;
+  $("mute").disabled = true; $("mute").textContent = "Mute"; muted = false;
+  $("meter").firstChild.style.width = "0";
+}
+
+$("call").onclick = () => call ? stopCall() : startCall();
+$("mute").onclick = () => {
+  if (!call) return;
+  muted = !muted;   // the worklet sends silence, never stops: stem needs a continuous stream
+  call.micNode.port.postMessage({muted});
+  $("mute").textContent = muted ? "Unmute" : "Mute";
+};
+
+function showNotice(text) { const n = $("notice"); n.textContent = text; n.style.display = text ? "block" : "none"; }
+
+// ---------------------------------------------------------------- board rendering
+function drawMenu(m) {
+  let h = "<h3>Pizzas <span class='small'>S / M / L</span></h3>";
+  for (const [n, p] of Object.entries(m.pizzas))
+    h += `<div class="row"><span>${esc(n)}</span><span class="price">${p.map(money).join(" / ")}</span></div>`;
+  h += `<div class="small">Extra toppings ${m.topping_price.map(money).join(" / ")}: ${m.toppings.map(esc).join(", ")}. Stuffed crust +$2.00.</div>`;
+  for (const sec of ["sides", "drinks", "desserts"]) {
+    h += `<h3>${sec[0].toUpperCase() + sec.slice(1)}</h3>`;
+    for (const [n, p] of Object.entries(m[sec]))
+      h += `<div class="row"><span>${esc(n)}</span><span class="price">${money(p)}</span></div>`;
+  }
+  $("menu").innerHTML = h; menuDrawn = true;
+}
+function drawOrder(o) {
+  const sig = JSON.stringify(o.lines);
+  $("lines").innerHTML = o.lines.length ? o.lines.map(l =>
+    `<div class="row" data-line="${l.line}"><span class="n">${l.line}.</span><span class="item">${esc(l.item)}</span><span class="price">${money(l.price)}</span></div>`
+  ).join("") : '<div class="empty">Nothing yet — start a call and order.</div>';
+  if (sig !== lastSig && o.changed_line) {
+    const el = document.querySelector(`[data-line="${o.changed_line}"]`);
+    if (el) el.classList.add("flash");
+  }
+  lastSig = sig;
+  let t = `<div class="row"><span>Subtotal</span><span class="price">${money(o.subtotal)}</span></div>`;
+  if (o.delivery_fee) t += `<div class="row"><span>Delivery</span><span class="price">${money(o.delivery_fee)}</span></div>`;
+  t += `<div class="row"><span>Tax</span><span class="price">${money(o.tax)}</span></div>`;
+  t += `<div class="row total"><span>Total</span><span>${money(o.total)}</span></div>`;
+  $("totals").innerHTML = t;
+  const c = o.customer;
+  $("customer").innerHTML = c ? `${esc(c.name)} · ${esc(c.fulfillment)}${c.address ? " · " + esc(c.address) : ""}${c.phone ? " · " + esc(c.phone) : ""}` : "";
+  const s = $("submitted");
+  if (o.submitted) { s.style.display = "block"; s.textContent = `✓ Order #${o.submitted.number} placed — ready in about ${o.submitted.ready_in_minutes} minutes`; }
+  else s.style.display = "none";
+}
+function drawLog(log) {
+  const el = $("log"), atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  el.innerHTML = log.map(e => e.kind === "fn"
+    ? `<div class="fn ${e.ok ? "" : "err"}"><b>${esc(e.name)}</b>(${esc(e.args)})<br>→ ${esc(e.result)}</div>`
+    : `<div class="msg ${esc(e.role)}">${esc(e.content)}</div>`).join("");
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+function drawStatus(s) {
+  const el = $("status"); el.textContent = s;
+  el.className = "pill " + (s.startsWith("agent") ? "agent" : s.startsWith("caller") ? "caller" : "");
+}
+
+// ---------------------------------------------------------------- server socket
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/events`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = ev => {
+    if (ev.data instanceof ArrayBuffer) {           // agent audio, 24 kHz int16
+      if (call) call.player.port.postMessage({pcm: ev.data}, [ev.data]);
+      return;
+    }
+    const m = JSON.parse(ev.data);
+    if (m.type === "state") {
+      if (!menuDrawn) drawMenu(m.menu);
+      drawOrder(m.order); drawLog(m.log); drawStatus(m.status);
+      if (m.audio === "terminal") { $("call").style.display = "none"; $("mute").style.display = "none"; $("meter").style.display = "none"; }
+    } else if (m.type === "flush") { if (call) call.player.port.postMessage({flush: true}); }
+    else if (m.type === "reply_done") { if (call) call.player.port.postMessage({done: true}); }
+    else if (m.type === "notice") showNotice(m.text);
+    else if (m.type === "call" && m.state === "ended") { if (call) stopCall(false); }
+    else if (m.type === "call" && m.state === "connected") showNotice("");
+  };
+  ws.onclose = () => { if (call) stopCall(false); drawStatus("disconnected — retrying"); setTimeout(connect, 1500); };
+}
+connect();
+</script></body></html>

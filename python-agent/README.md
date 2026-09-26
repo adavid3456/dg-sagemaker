@@ -156,12 +156,27 @@ weaker Qwen3-4B, so they still steer conservatively.
 `pizza_demo.py` shows the agent calling functions. Tony takes a phone order off a
 fixed menu, and a local web page (http://127.0.0.1:8765, opened automatically)
 shows the menu, the order as it builds, every function call with its result, and
-the transcript.
+the transcript. You talk to Tony **through the page**: click *Start call*.
 
 ```bash
-uv run pizza_demo.py --push-to-talk               # laptop speakers
-uv run pizza_demo.py --conversational             # headphones, Conversational Mode on
+uv run pizza_demo.py --host <public-ip>                    # laptop speakers are fine
+uv run pizza_demo.py --host <public-ip> --conversational
+uv run pizza_demo.py --host <public-ip> --terminal-audio   # old terminal mic/speaker path
 ```
+
+- **Browser audio and echo cancellation.**
+  - The page captures the mic with `getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true}})`. The browser's WebRTC echo canceller removes Tony's voice from the mic, so laptop speakers work without push-to-talk. The header shows whether the browser actually applied echo cancellation.
+  - Mic audio goes to the script as 16 kHz PCM over the page's WebSocket, and the script relays it to stem. Tony's 24 kHz audio comes back the same way.
+- **Playback path.**
+  - Tony's audio plays through a local WebRTC loopback (two `RTCPeerConnection`s in the page) into an `<audio>` element. Chrome's echo canceller has historically only subtracted audio played through WebRTC.
+  - `?playback=direct` on the page URL plays through plain Web Audio instead, for an A/B.
+  - Both paths re-buffer on a mid-reply underrun (`--playback-buffer-ms`).
+- **Page address.** Open the page as `127.0.0.1` or `localhost`. Browsers only allow the mic from a secure context, and a plain-http LAN address isn't one.
+- **Muting and calls.**
+  - *Mute* sends silence rather than stopping the stream, because stem needs continuous audio.
+  - Closing the tab hangs up.
+  - Each call starts a fresh order.
+- **`--terminal-audio`** keeps the `agent_live.py` loop, including push-to-talk and the escalation demo. In that mode the page is a display only.
 
 - **Functions.** The five functions are client-side: `add_item`, `update_item`,
   `remove_item`, `set_customer` and `submit_order`.
@@ -171,9 +186,17 @@ uv run pizza_demo.py --conversational             # headphones, Conversational M
 - **`defer_until_eot`.** Every function sets it, so stem only dispatches a call
   after a confirmed end of turn. An eager end-of-turn draft can't add the same
   pizza twice.
-- **Shared flags.** Audio and all `agent_live.py` flags work the same here,
-  including push-to-talk, recording and escalation. `--web-port` and
-  `--no-browser` control the board.
+- **Other flags.** `--conversational` and the other Conversational Mode flags,
+  `--host`/`--port`, recording (`<time>_pizza_*.wav`) and `--playback-buffer-ms`
+  work in both modes. `--web-port` and `--no-browser` control the board.
+- **Checked 2026-09-25 without a GPU box.** Headless Chrome drove the page, with
+  its fake microphone, against a stand-in stem:
+  - mic PCM reached "stem" at real time (32 KB/s);
+  - the browser reported echo cancellation on;
+  - agent audio came out of the loopback `<audio>` element;
+  - a function call updated the board, and barge-in, hang-up and the recording all worked.
+
+  How well echo cancellation works on real speakers still needs a live call.
 
 Verified 2026-09-25 against the self-contained container (Qwen3.6-35B-A3B-FP8
 through vLLM's `qwen3_coder` tool parser):
