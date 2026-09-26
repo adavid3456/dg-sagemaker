@@ -18,6 +18,11 @@ Against the container's stem directly (the EC2 loop):
         --file ../test-audio-files/127389__acclivity__thetimehascome_mono16k.wav \
         --out reply.wav
 
+Add --conversational to either `talk` or agent_live.py to turn on Conversational
+Mode ("Chatty"): it sends `agent.think_conversational`, and `talk` then reports the
+chatty telemetry it saw (semantic-EOT scores, probe decisions, backchannels). Run
+the same file with and without it for an A/B.
+
 The default port is stem's 8092, NOT the shim's 8080. Talking to stem directly
 keeps the SageMaker bidi transport and its SigV4 signing out of the picture while
 the speech pipeline itself is what's being debugged. The shim front door is what
@@ -36,6 +41,8 @@ import urllib.error
 import urllib.request
 import wave
 
+from scenarios import add_scenario_arg, apply_scenario
+
 try:
     import websockets
 except ImportError:
@@ -49,6 +56,41 @@ except ImportError:
 INPUT_RATE = 16000
 OUTPUT_RATE = 24000
 CHUNK_MS = 20
+
+
+def add_conversational_args(p: argparse.ArgumentParser) -> None:
+    """Conversational Mode flags, shared by `talk` and agent_live.py.
+
+    Every tuning flag is optional. Unset means the field is omitted, and stem falls
+    back to the container's `[voice_agent.chatty_integration]` defaults. The schema
+    is stem's messages/src/public/v1/agent/think_conversational.rs, which denies
+    unknown fields, so a bad value is a settings Error rather than a silent no-op.
+    """
+    g = p.add_argument_group("Conversational Mode (Chatty)")
+    g.add_argument("--conversational", action="store_true",
+                   help="send agent.think_conversational (off = the classic agent)")
+    g.add_argument("--telemetry", choices=["none", "standard", "verbose"],
+                   default="standard",
+                   help="ConversationalEvent frames to request (default: standard)")
+    g.add_argument("--agent-backchannel-sensitivity", type=float)
+    g.add_argument("--presence-check-max-count", type=int)
+    g.add_argument("--presence-check-interval-ms", type=int)
+    g.add_argument("--frustration-max-count", type=int)
+    g.add_argument("--restricted-terms", nargs="+", metavar="TERM")
+
+
+def build_conversational(args) -> dict | None:
+    """The `agent.think_conversational` block, or None when it is off."""
+    if not getattr(args, "conversational", False):
+        return None
+    provider: dict = {"type": "deepgram", "telemetry": args.telemetry}
+    for field in ("agent_backchannel_sensitivity", "presence_check_max_count",
+                  "presence_check_interval_ms", "frustration_max_count",
+                  "restricted_terms"):
+        value = getattr(args, field, None)
+        if value is not None:
+            provider[field] = value
+    return {"provider": provider}
 
 
 def build_settings(args) -> dict:
@@ -66,8 +108,12 @@ def build_settings(args) -> dict:
     https/wss unconditionally, so a loopback one is rejected; leaving it unset
     routes TTS through stem's driver pool, which the container pins to the TTS
     impeller by driver purpose.
+
+    `think_conversational` is added only with --conversational. It is independent
+    of `think`: Conversational Mode decides WHEN the agent speaks, `think` WHAT it
+    says, so turning it on changes nothing about the LLM leg.
     """
-    return {
+    settings = {
         "type": "Settings",
         "audio": {
             "input": {"encoding": "linear16", "sample_rate": INPUT_RATE},
@@ -100,6 +146,10 @@ def build_settings(args) -> dict:
             },
         },
     }
+    conversational = build_conversational(args)
+    if conversational is not None:
+        settings["agent"]["think_conversational"] = conversational
+    return settings
 
 
 def read_wav(path: str) -> bytes:
@@ -136,6 +186,20 @@ def _http_ok(url: str, timeout: float = 5.0) -> tuple[bool, str]:
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
     except Exception as e:  # connection refused, timeout, DNS, ...
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _http_post_ok(url: str, body: dict, timeout: float = 30.0) -> tuple[bool, str]:
+    """POST a JSON body. The chatty routes are POST-only, so GET says nothing."""
+    req = urllib.request.Request(url, json.dumps(body).encode(),
+                                 {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            text = r.read(400).decode("utf-8", "replace").strip()
+            return 200 <= r.status < 300, f"HTTP {r.status} {text[:180]}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
 
@@ -181,6 +245,23 @@ def cmd_health(args) -> int:
         print(f"  FAIL  {label:28} {url}")
         print(f"          {detail}")
         worst = 1
+    # Conversational Mode: the chatty package rides in impeller-asr. 503 means the
+    # package is not loaded (models-chatty/ empty, or still loading); only
+    # sessions with --conversational need it, so report it without failing the
+    # classic-agent health.
+    chatty = [
+        ("impeller-asr  chatty eot_bc", f"http://{h}:8083/v2/eot_bc", {}),
+        ("impeller-asr  chatty backchannel", f"http://{h}:8083/v2/backchannel",
+         {"transcript": "mhmm"}),
+        ("impeller-asr  chatty gen", f"http://{h}:8083/v2/chatty",
+         {"event": "customer_speech"}),
+    ]
+    for label, url, body in chatty:
+        ok, detail = _http_post_ok(url, body)
+        tag = "OK  " if ok else "WARN"
+        print(f"  {tag}  {label:28} POST {url}")
+        if not ok:
+            print(f"          {detail} — Conversational Mode sessions will degrade")
     print()
     if worst:
         print("At least one component is down. `docker logs <container>` names the")
@@ -204,12 +285,16 @@ async def cmd_talk(args) -> int:
     print(f"connecting: {url}")
     print(f"  asr={args.asr_model}  llm={args.llm_model} @ {args.llm_url}")
     print(f"  tts={args.tts_model}")
+    conv = settings["agent"].get("think_conversational")
+    print(f"  conversational={json.dumps(conv['provider']) if conv else 'off'}")
     print(f"  audio: {len(pcm) / 2 / INPUT_RATE:.1f}s from {args.file}")
     print()
 
     out_audio = bytearray()
     transcripts: list[tuple[str, str]] = []
     events: list[str] = []
+    conversational: dict[str, int] = {}
+    frustration: list[dict] = []
     fatal: str | None = None
 
     async with websockets.connect(url, max_size=None) as ws:
@@ -269,6 +354,20 @@ async def cmd_talk(args) -> int:
                     print(f"  [{t}] {detail}")
                     if t == "Error":
                         fatal = detail
+                elif t == "ConversationalEvent":
+                    ev = m.get("event", "?")
+                    conversational[ev] = conversational.get(ev, 0) + 1
+                    if ev in ("agent_backchannel", "user_backchannel"):
+                        print(f"  [{ev}] {m.get('text', '')}")
+                    elif ev == "probe_decision" and m.get("spoke"):
+                        print(f"  [probe_decision] spoke trigger={m.get('trigger')} "
+                              f"intent={m.get('intent')}")
+                    elif args.verbose:
+                        print(f"  [{ev}] {json.dumps(m)}")
+                elif t == "FrustrationDetected":
+                    frustration.append(m)
+                    print(f"  [FrustrationDetected] count={m.get('count')} "
+                          f"escalated={m.get('escalated')}")
                 elif args.verbose:
                     print(f"  [{t}]")
 
@@ -303,6 +402,18 @@ async def cmd_talk(args) -> int:
         ("TTS  (non-silent audio out)", peak > 0,
          f"{len(out_audio)} bytes, peak amplitude {peak}"),
     ]
+    # With Conversational Mode on, eot_score frames are the proof that stem reached
+    # /v2/eot_bc: ConvoLLM scores every transcript change, so a run with user
+    # speech and zero scores means the chatty leg is not working. The other events
+    # depend on what the audio contains, so they are reported, not scored.
+    if conv:
+        results.append((
+            "CHATTY (ConvoLLM eot_score frames)",
+            conversational.get("eot_score", 0) > 0,
+            ", ".join(f"{k}={v}" for k, v in sorted(conversational.items()))
+            + (f", frustration={len(frustration)}" if frustration else "")
+            or "no ConversationalEvent frames",
+        ))
     print()
     for label, ok, detail in results:
         print(f"  {'PASS' if ok else 'FAIL'}  {label:34} {detail}")
@@ -319,7 +430,8 @@ async def cmd_talk(args) -> int:
             print("Audio came back but nothing was transcribed — that is likely the")
             print("greeting alone. Check the ASR engine and the listen provider model.")
         return 1
-    print("PASS: all three legs of the loop worked end to end.")
+    print("PASS: all three legs of the loop worked end to end"
+          + (", with Conversational Mode." if conv else "."))
     return 0
 
 
@@ -346,17 +458,19 @@ def main() -> int:
                     help="must match the container's vLLM --served-model-name")
     pt.add_argument("--llm-url", default="http://127.0.0.1:3081/v1/chat/completions",
                     help="resolved INSIDE the container, so keep it loopback")
-    pt.add_argument("--prompt",
-                    default="You are a helpful voice assistant. Reply in one or "
-                            "two short spoken sentences.")
-    pt.add_argument("--greeting", default="Hi, how can I help?")
+    pt.add_argument("--prompt", help="agent prompt (default: the scenario's, else "
+                                     "a generic voice assistant)")
+    pt.add_argument("--greeting", help="agent greeting (default: the scenario's)")
+    add_scenario_arg(pt)
     pt.add_argument("--linger", type=float, default=20.0,
                     help="seconds to keep the socket open after the audio ends, "
                          "waiting for end-of-turn, the LLM, and TTS")
     pt.add_argument("--verbose", action="store_true", help="print every event")
+    add_conversational_args(pt)
     pt.set_defaults(func=cmd_talk)
 
     args = p.parse_args()
+    apply_scenario(args)
     if asyncio.iscoroutinefunction(args.func):
         return asyncio.run(args.func(args))
     return args.func(args)

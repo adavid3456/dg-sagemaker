@@ -8,3 +8,6 @@ build/
 .gradle/
 bin/
 java/**/libs/
+
+# agent_live.py session recordings (voices; never commit)
+python-agent/recordings/

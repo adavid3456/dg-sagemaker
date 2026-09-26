@@ -65,6 +65,147 @@ Input must be **mono 16-bit PCM at 16 kHz** — stem transcodes into Flux at tha
 rate regardless, so matching it avoids a resample and makes a mismatch fail here
 rather than degrade quality silently.
 
+## Conversational Mode (Chatty)
+
+Add `--conversational` to `talk` or `agent_live.py` to send
+`agent.think_conversational`. The container must carry the chatty package
+(`health` POSTs its three routes and prints `WARN` if they return 503).
+
+```bash
+uv run agent_converse.py talk --host <host> --file audio16k.wav              # classic
+uv run agent_converse.py talk --host <host> --file audio16k.wav --conversational
+uv run agent_live.py --conversational --presence-check-interval-ms 5000
+```
+
+**On laptop speakers the agent hears itself** through the mic and barges in on
+its own voice. Use headphones, or add `--push-to-talk`: the mic starts muted, and
+Enter toggles it (a terminal sees no key-release, so this is a toggle, not
+hold-to-talk). While muted the client streams silence instead of stopping, so
+turns still end and presence checks still fire. What you give up is barge-in and
+user backchannels during the agent's speech, unless you unmute first.
+
+**Escalation demo (default in `agent_live.py`).** Stem only *reports* frustration:
+`FrustrationDetected` carries `escalated=true` once the frustrated-turn count reaches
+the server's `max_count` (2 in this container; override with
+`--frustration-max-count`). It speaks nothing itself, by design, because the
+customer's app owns the handoff. On the first escalated event the live client plays
+that app:
+
+1. It sends `UpdatePrompt` with a senior-specialist persona. Stem keeps earlier
+   prompts in history, so this layers on top of the original prompt.
+2. It sends `InjectAgentMessage` with `behavior: "queue"`, so the handoff line plays
+   right after the agent's current reply. The default behavior would be refused
+   mid-reply. If the user is speaking, stem refuses the injection anyway; the client
+   retries up to 3 times.
+
+`--no-escalate-demo` just prints the event. `--handoff-line` and
+`--specialist-prompt` change the wording. Repeating the same unanswered question 2–3
+times is the most reliable way to trigger it.
+
+It is independent of `think`: Conversational Mode decides *when* the agent speaks,
+`think` decides *what* it says. The tuning flags (`--agent-backchannel-sensitivity`,
+`--presence-check-max-count`, `--presence-check-interval-ms`,
+`--frustration-max-count`, `--restricted-terms`) are sent only when given. Otherwise
+the server's `[voice_agent.chatty_integration]` defaults apply.
+
+`talk` requests `standard` telemetry by default and scores an extra line, `CHATTY`,
+which passes when at least one `eot_score` frame arrived. That frame proves stem
+reached ConvoLLM (`/v2/eot_bc`). Backchannels and probe decisions are reported but
+not scored, because whether they fire depends on the audio.
+
+## Session recordings (on by default)
+
+`agent_live.py` saves every session to `./recordings/` (gitignored) when you hang up:
+
+- `<time>[_<scenario>]_stereo_24k.wav`: you on the left, the agent on the right,
+  time-aligned. This is the one to listen to.
+- `..._user_16k.wav`: exactly what was sent to stem (silence while muted with
+  `--push-to-talk`).
+- `..._agent_24k.wav`: exactly what your speakers played, after any barge-in flush,
+  so it's what you actually heard.
+
+`--no-record` turns it off; `--record-dir` moves it. Recordings contain your voice,
+and this repo is public, so keep them out of git (the `.gitignore` entry does that).
+
+## Role-play scenarios
+
+`--scenario` (both clients) swaps the generic assistant for a fictional business.
+It sets the prompt and greeting, and in `agent_live.py` also the escalation handoff
+line and specialist persona, so a frustrated caller is escalated within the same
+business. Explicit `--prompt` / `--greeting` / `--handoff-line` /
+`--specialist-prompt` still win. The presets live in `scenarios.py`.
+
+| scenario | agent → escalates to | what the agent does |
+|---|---|---|
+| `car-dealership` | Jordan (sales) → Casey (sales manager) | finds a vehicle, discusses trade-in and financing generally, books a test drive |
+| `pharmacy` | Riley (support) → Dr. Patel (pharmacist) | refills, order and pickup status, transfers. Verifies name and DOB first, gives no medical advice, sends emergencies to 911 |
+| `home-loan` | Morgan (intake) → Alex (senior loan officer) | collects pre-qualification details one at a time (name, location, purchase or refi, price, down payment, income, employment, credit range) and reads them back |
+
+```bash
+uv run agent_live.py --conversational --scenario home-loan
+```
+
+Every prompt forbids inventing facts the agent can't know: prices, stock, rates,
+approvals, a patient's medication. The LLM behind this container has no tools or
+data, so a confident invention would sound like a pipeline bug. Stay on-topic: the
+Qwen3.6 stand-in holds the persona well, but these presets were written for the
+weaker Qwen3-4B, so they still steer conservatively.
+
+## Pizza ordering demo (function calling + live order board)
+
+`pizza_demo.py` shows the agent calling functions. Tony takes a phone order off a
+fixed menu, and a local web page (http://127.0.0.1:8765, opened automatically)
+shows the menu, the order as it builds, every function call with its result, and
+the transcript.
+
+```bash
+uv run pizza_demo.py --push-to-talk               # laptop speakers
+uv run pizza_demo.py --conversational             # headphones, Conversational Mode on
+```
+
+- **Functions.** The five functions are client-side: `add_item`, `update_item`,
+  `remove_item`, `set_customer` and `submit_order`.
+  - Stem sends each call as a `FunctionCallRequest`.
+  - The script applies it to the order it holds and answers with a `FunctionCallResponse` containing the updated lines and total. Prices the agent reads out come from the script, not the LLM.
+  - Bad calls (off-menu item, missing size, delivery with no address) come back as `ok:false` with the reason, and the agent asks the caller.
+- **`defer_until_eot`.** Every function sets it, so stem only dispatches a call
+  after a confirmed end of turn. An eager end-of-turn draft can't add the same
+  pizza twice.
+- **Shared flags.** Audio and all `agent_live.py` flags work the same here,
+  including push-to-talk, recording and escalation. `--web-port` and
+  `--no-browser` control the board.
+
+Verified 2026-09-25 against the self-contained container (Qwen3.6-35B-A3B-FP8
+through vLLM's `qwen3_coder` tool parser):
+
+- A scripted five-turn order ran end to end: add, modify, remove, set customer,
+  submit. It made seven function calls, and the page's state matched.
+- On the first turn, the model sometimes promises to add an item without calling
+  `add_item`. That happened in 1 of 6 runs even with the prompt rules added
+  against it. If the board doesn't update, say "add that".
+
+## Reproducing the "answer filtered as backchannel" issue
+
+`repro_backchannel_answer.py` makes a Chatty misclassification deterministic, for
+reporting. It speaks a fixed yes/no question with `InjectAgentMessage`, streams an
+answer WAV at a fixed offset (the client plays no audio), and uses a fresh session
+per trial:
+
+```bash
+uv run repro_backchannel_answer.py --host 127.0.0.1 --anchor start \
+    --phrase yeah_not.wav --control no_not.wav --offsets 1.0 --repeats 5
+```
+
+On 2026-09-25 (Qwen3.6-35B-A3B-FP8, prod chatty config), "Yeah. Not right now."
+starting 1.0 s into the question was filtered 5/5, every time at confidence 0.64.
+"No, not right now." at the same moment was 0/5. Starting ≥2 s in, both are normal
+turns. Hosted reproduces it too (`--url wss://agent.deepgram.com/v1/agent/converse
+--token "$DEEPGRAM_API_KEY" --think hosted`): 4/5 filtered, control 0/5. The script
+is standalone (no imports from this folder), so it can be shared as a single file. Use `--anchor start`: the end-anchored default can't overlap by more than
+~1 s, because the question's length is known only from `AgentAudioDone`, which
+arrives about 1 s before the audio ends. The WAVs are macOS `say -v Samantha`, 16 kHz
+mono.
+
 ## Notes
 
 - **Port 8092 is stem, not the shim.** Talking to stem directly keeps the
@@ -88,3 +229,24 @@ rather than degrade quality silently.
 That is usually the greeting alone: it is synthesized before any audio is sent,
 so TTS can succeed while ASR produced nothing. Check the ASR engine and the
 `--asr-model` value. The driver calls this case out explicitly when it sees it.
+
+## Agent audio is choppy or breaks up
+
+That is the network, not TTS. Stem paces agent audio to real time with only a 1 s
+lead (`STREAMING_PLAYBACK_LEAD_TIME` in stem's `pipeline/tts.rs`), so any stretch
+where the link delivers slower than real time drains the speaker queue. Measured
+2026-09-25 with identical text:
+
+| where the client ran | lead at the end of each reply |
+|---|---|
+| on the Sydney host | 1.0 s on all 6 replies |
+| a US laptop over the SSM tunnel | 1.0 s on 4 replies, 0.07 s and −0.16 s on the other 2 |
+
+`agent_live.py` and `pizza_demo.py` re-buffer when the queue runs dry mid-reply
+(`--playback-buffer-ms`, default 250), which turns the crackle into a short pause.
+They print how many times that happened at hang-up. The real fix is to connect
+to the host's public IP (`--host <public-ip>`, security group open to your /32 on
+8092) rather than over an SSM tunnel: over the public IP from the same laptop the
+lead held at 0.77–1.01 s on 12/12 replies.
+Recordings show which it was: the agent track has exact-zero holes in multiples
+of 20 ms wherever playback ran dry.
