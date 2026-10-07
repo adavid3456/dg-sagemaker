@@ -146,6 +146,10 @@ def build_settings(args) -> dict:
             },
         },
     }
+    if args.demo_function:
+        think = settings["agent"]["think"]
+        think["functions"] = [DEMO_FUNCTION]
+        think["prompt"] = (think.get("prompt") or "") + DEMO_FUNCTION_PROMPT
     conversational = build_conversational(args)
     if conversational is not None:
         settings["agent"]["think_conversational"] = conversational
@@ -277,6 +281,28 @@ def cmd_health(args) -> int:
 # ──────────────────────────────── talk ─────────────────────────────────
 
 
+# A client-side function for exercising the think leg's tool calling: the model
+# must emit a structured call (which the vLLM tool parser has to recognize, or it
+# silently arrives as plain text), stem forwards it as a FunctionCallRequest, and
+# the client answers with a canned FunctionCallResponse.
+DEMO_FUNCTION = {
+    "name": "check_availability",
+    "description": "Look up open appointment times for a given day.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "day": {"type": "string", "description": "The day the caller asked about, e.g. 'tomorrow' or 'Friday'."},
+        },
+        "required": ["day"],
+    },
+}
+DEMO_FUNCTION_PROMPT = (
+    " Whenever the caller asks about booking, scheduling, an appointment, a visit or"
+    " a time to come in, call check_availability before offering any time."
+)
+DEMO_FUNCTION_RESULT = {"available": ["10:00 AM", "2:30 PM"]}
+
+
 async def cmd_talk(args) -> int:
     pcm = read_wav(args.file)
     url = f"ws://{args.host}:{args.port}/v1/agent/converse"
@@ -295,6 +321,7 @@ async def cmd_talk(args) -> int:
     events: list[str] = []
     conversational: dict[str, int] = {}
     frustration: list[dict] = []
+    function_calls: list[dict] = []
     fatal: str | None = None
 
     async with websockets.connect(url, max_size=None) as ws:
@@ -364,6 +391,18 @@ async def cmd_talk(args) -> int:
                               f"intent={m.get('intent')}")
                     elif args.verbose:
                         print(f"  [{ev}] {json.dumps(m)}")
+                elif t == "FunctionCallRequest":
+                    for f in m.get("functions", []):
+                        function_calls.append(f)
+                        print(f"  [FunctionCallRequest] {f.get('name')}({f.get('arguments')}) "
+                              f"client_side={f.get('client_side')}")
+                        if f.get("client_side"):
+                            await ws.send(json.dumps({
+                                "type": "FunctionCallResponse",
+                                "id": f.get("id"),
+                                "name": f.get("name"),
+                                "content": json.dumps(DEMO_FUNCTION_RESULT),
+                            }))
                 elif t == "FrustrationDetected":
                     frustration.append(m)
                     print(f"  [FrustrationDetected] count={m.get('count')} "
@@ -402,6 +441,12 @@ async def cmd_talk(args) -> int:
         ("TTS  (non-silent audio out)", peak > 0,
          f"{len(out_audio)} bytes, peak amplitude {peak}"),
     ]
+    if args.demo_function:
+        results.append((
+            "TOOLS (FunctionCallRequest)", bool(function_calls),
+            ", ".join(f"{f.get('name')}({f.get('arguments')})" for f in function_calls)
+            or "the LLM never called check_availability",
+        ))
     # With Conversational Mode on, eot_score frames are the proof that stem reached
     # /v2/eot_bc: ConvoLLM scores every transcript change, so a run with user
     # speech and zero scores means the chatty leg is not working. The other events
@@ -466,6 +511,9 @@ def main() -> int:
                     help="seconds to keep the socket open after the audio ends, "
                          "waiting for end-of-turn, the LLM, and TTS")
     pt.add_argument("--verbose", action="store_true", help="print every event")
+    pt.add_argument("--demo-function", action="store_true",
+                    help="declare a client-side check_availability function, answer "
+                         "its FunctionCallRequest, and score that the LLM called it")
     add_conversational_args(pt)
     pt.set_defaults(func=cmd_talk)
 
