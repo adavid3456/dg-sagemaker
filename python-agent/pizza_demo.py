@@ -591,6 +591,7 @@ def main() -> int:
     args = p.parse_args()
     args.prompt = args.prompt or PROMPT
     args.greeting = args.greeting or GREETING
+    args.demo_function = False   # build_settings reads it; the pizza FUNCTIONS replace the demo one
     apply_scenario(args)
     try:
         return asyncio.run(amain(args))
